@@ -3,8 +3,8 @@
 
 ## 三个模块
 
-dmsfwsk_lite：
-safwk_lite：
+dmsfwsk_lite：分布式任务调度实现（只支持FA）
+safwk_lite：负责提供基础服务运行的空进程（foundation进程实现），用以启动或初始化服务管理器，并使其持续运行
 samgr_lite：系统服务框架基于面向服务的架构，提供了服务开发、服务的子功能开发、对外接口的开发、以及多服务共进程、进程间服务调用等开发能力
 
 ```plantuml
@@ -78,6 +78,8 @@ samgr_lite：系统服务框架基于面向服务的架构，提供了服务开�
 -   Provider：服务的提供者，为系统提供能力（对外接口）。
 -   Consumer：服务的消费者，调用服务提供的功能（对外接口）。
 -   Samgr：作为中介者，管理Provider提供的能力，同时帮助Consumer发现Provider的能力。
+
+
 
 
 ```plantuml
@@ -484,4 +486,140 @@ typedef struct SimpleVector {
 
 ```
 
-### 从系统的拉起过程看服务注册与发现
+### 从轻量系统的拉起过程看服务注册与发现
+
+```c
+//系统初始化
+void OHOS_SystemInit(void)
+{
+    MODULE_INIT(bsp);
+    MODULE_INIT(device);
+    MODULE_INIT(core);
+    SYS_INIT(service); //注册系统服务
+    SYS_INIT(feature); //注册系统服务的特性
+    MODULE_INIT(run);
+    SAMGR_Bootstrap(); //启功samgr并管理系统服务和特性
+}
+```
+
+SYS_INIT()负责初始化由SYS_SERVICE_INIT，SYS_FEATURE_INIT宏进行修饰的服务和特性
+
+
+
+```c
+#define LAYER_INITCALL(func, layer, clayer, >priority)            \
+    static const InitCall USED_ATTR >__zinitcall_##layer##_##func \
+        __attribute__((section(".zinitcall." clayer >#priority ".init"))) = func
+#endif
+
+#define LAYER_INITCALL_DEF(func, layer, clayer) \
+    LAYER_INITCALL(func, layer, clayer, 2)
+
+#define SYS_SERVICE_INIT(func) LAYER_INITCALL_DEF(func, sys_service, "sys.service")
+
+#define SYS_FEATURE_INIT(func) LAYER_INITCALL_DEF(func, sys_feature, "sys.feature")
+
+```
+
+```c
+static void Init(void)
+{
+    PubSubFeature *feature = &g_broadcastFeature;
+    feature->relations.topic = -1;
+    feature->relations.callbacks.consumer = NULL;
+    UtilsListInit(&feature->relations.callbacks.node);
+    UtilsListInit(&feature->relations.node);
+    feature->mutex = MUTEX_InitValue();
+    SAMGR_GetInstance()->RegisterFeature(BROADCAST_SERVICE, (Feature *)feature);
+
+    PubSubImplement *apiEntry = BCE_CreateInstance((Feature *)feature);
+    SAMGR_GetInstance()->RegisterFeatureApi(BROADCAST_SERVICE, PUB_SUB_FEATURE, GET_IUNKNOWN(*apiEntry));
+}
+SYS_FEATURE_INIT(Init);
+
+```
+其实现与Linux的initcall相似
+>Linux内核使用了一个称为initcall的机制，该机制允许在内核启动时以特定的顺序执行初始化函数。initcall背后的基本思想是将一系列的初始化函数地址存储在特定的内存区段，然后在内核启动时按顺序执行这些函数。
+>这个机制依赖GCC的特性，特别是\_\_attribute\_\_((section(...))),\_\_attribute\_\_((section(...)))将函数地址在链接时放入zInit代码段，而后由其它函数遍历这些段内的函数
+
+#### BOOT_SYS阶段
+```plantuml
+    !theme plain
+    |OHOS_SystemInit|
+    :OHOS_SystemInit();
+    group 注册系统服务
+    :SYS_INIT(service)遍历所有SYS_SERVICE_INIT宏修饰的Init();
+    group 注册Bootstrap
+    :注册Bootstrap;
+    :调用SAMGR_GETInstance()获取单例对象g_samrImpl;
+    :g_samrImpl懒加载;
+    :调用g_samrImpl的RegisterService进行注册;
+    :为BootStrap(继承自Servcie)创建一个ServiceImpl进行管理;
+    :将该ServiceImpl VECTOR_Add()到g_samrImpl的services字段中;
+    end group
+    :注册Broadcast;
+    :注册Hiview;
+    end group
+    group 注册系统服务的特性
+    :SYS_INIT(feature)遍历所有SYS_Feature_INIT宏修饰的Init();
+    group 注册Broadcast的特性PUB_SUB_FEAFURE
+    :调用g_samrImpl的RegisterFeature()注册特性;
+    :为PUB_SUB_FEAFURE创建FeatureImpl进行管理;
+    :将该FeatureImpl VECTOR_Add()到serviceImpl的features字段中;
+    :创建特性接口g_pubSubImplement
+    关联g_pubSubImplement与PubSubFeature对象;
+    :调用RegisterFeatureApi注册特性的默认接口
+    使serviceImpl->defaultApi指向g_pubSubImplement.iUnknown;
+    end group
+    end group
+    group 调用SAMGR_Bootstrap()启动服务和特性
+    :samgr创建Vector initServices记录未初始化的服务
+    （根据serviceImpl的inited字段是否为SVC_INIT);
+    group 调用InitializeAllServices()初始化所有未初始化服务
+    :调用AddTaskPool()为服务创建任务池和消息队列;
+    :调用InitializeSingleService()向消息队列发送MSG_DIRECT的初始化消息;
+    :调用SAMGR_StartTaskPool()启动各服务线程
+    各服务循环监听各自消息队列;
+    end group
+    end group
+```
+
+#### InitializeSingleService启动特性
+
+```plantuml
+    !theme plain
+    Participant Samgr
+    Queue MQueue
+    Samgr -> MQueue : 发送type为MSG_DIRECT\n且handle为HandleInitRequest()的request
+    MQueue --> Samgr
+    MQueue -> Broadcast : 循环监听消息队列，获取request
+    activate Broadcast
+    Broadcast -> BroadcastFeature : 调用OnInitialize()进行初始化
+    activate BroadcastFeature
+    BroadcastFeature --> Broadcast : 
+    deactivate BroadcastFeature
+    Broadcast --> MQueue
+    deactivate Broadcast
+
+```
+
+#### BOOT_APP阶段
+所有由SYS_SERVICE_INIT()和SYS_FEATURE_INIT()修饰的服务与特性启动完毕,接下来启动由SYSEX_SERVICE_INIT,SYSEX_FEATURE_INIT,APP_SERVICE_INIT,APP_FEATURE_INIT修饰的服务与特性
+
+```plantuml
+    !theme plain
+    Participant Samgr
+    Queue MQueue
+    Samgr -> MQueue : 发送BOOT_SYS_COMPLETED的request
+    MQueue --> Samgr
+    MQueue -> Bootstrap : 循环监听消息队列，获取request
+    activate Bootstrap
+    Bootstrap -> "由SYSEX\APP_SERVICE\FEATURE_INIT宏\n修饰的服务与特性" : INIT_APP_CALL()
+    activate "由SYSEX\APP_SERVICE\FEATURE_INIT宏\n修饰的服务与特性"
+    "由SYSEX\APP_SERVICE\FEATURE_INIT宏\n修饰的服务与特性" --> Bootstrap
+    Bootstrap --> MQueue
+
+```
+
+#### BOOT_APP阶段
+所有由SYSEX_SERVICE_INIT,SYSEX_FEATURE_INIT,APP_SERVICE_INIT,APP_FEATURE_INIT修饰的服务与特性启动完毕
