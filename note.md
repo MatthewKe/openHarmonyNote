@@ -3,7 +3,13 @@
 
 ## 三个模块
 
-dmsfwsk_lite：分布式任务调度实现（只支持FA）
+//todo 部署视图，文件和模块
+
+//todo 底层信息通信机制（信号量？）
+
+
+
+dmsfwk_lite：分布式任务调度实现（支持FA）
 safwk_lite：负责提供基础服务运行的空进程（foundation进程实现），用以启动或初始化服务管理器，并使其持续运行
 samgr_lite：系统服务框架基于面向服务的架构，提供了服务开发、服务的子功能开发、对外接口的开发、以及多服务共进程、进程间服务调用等开发能力
 
@@ -20,6 +26,12 @@ samgr_lite：系统服务框架基于面向服务的架构，提供了服务开�
             component 服务间通信
         }
     }
+    folder dmsfwk_lite
+    folder safwk_lite
+    folder samgr_lite
+    dmsfwk_lite <-- 分布式框架
+    safwk_lite <-right- samgr_lite
+    samgr_lite <-- 服务管理
 
 ```
 
@@ -36,7 +48,7 @@ samgr_lite：系统服务框架基于面向服务的架构，提供了服务开�
     rectangle Consumer
 
     Samgr <-down- Consumer : 发现服务
-    Samgr <-down- Provider : 注册特性和服务
+    Samgr <-down- Provider : 注册服务和服务
     Provider <-right- Consumer : 调用服务
 ```
 #### 通信方式：
@@ -63,7 +75,7 @@ samgr_lite：系统服务框架基于面向服务的架构，提供了服务开�
 ```
 ```plantuml
    !theme plain
-    title 进程内异步通信
+    title 进程间异步通信
     rectangle Provider
     rectangle Consumer
     
@@ -104,7 +116,7 @@ samgr_lite：系统服务框架基于面向服务的架构，提供了服务开�
     max : int16
     top int16
     free : int16
-    data: void **
+    data : void **
     key : VECTOR_Key
     compare : VECTOR_Compare
     }
@@ -264,7 +276,7 @@ typedef struct SimpleVector {
     max : int16
     top int16
     free : int16
-    data: void **
+    data : void **
     key : VECTOR_Key
     compare : VECTOR_Compare
     }
@@ -621,5 +633,421 @@ SYS_FEATURE_INIT(Init);
 
 ```
 
-#### BOOT_APP阶段
+#### BOOT_DYNAMIC阶段
 所有由SYSEX_SERVICE_INIT,SYSEX_FEATURE_INIT,APP_SERVICE_INIT,APP_FEATURE_INIT修饰的服务与特性启动完毕
+
+### 消息队列
+
+```plantuml
+    !theme plain
+    hide empty members
+    struct TaskPool {
+        queueId : MQueueId
+        stackSize : uint16
+        priority : uint8
+        size : uint8
+        top : uint8
+        ref : int8
+        tasks : ThreadId
+        SAMGR_CreateFixedTaskPool()
+        SAMGR_StartTaskPool()
+        TaskEntry()
+        ProcResponse()
+        ProcDirectRequest()
+        ProcRequest()
+    }
+
+    struct Exchange{
+        id : Identity
+        request : Request
+        response : Response
+        type : short
+        handler : Handler
+        sharedRef : uint32
+    }
+
+    enum ExchangeType {
+        MSG_EXIT //终止消息处理任务
+        MSG_NON //不需要响应的请求消息，接收者调用服务的MessageHandle或特性的OnMessage
+        MSG_CON  //需要响应的请求消息，接收者调用服务的MessageHandle或特性的OnMessage
+        MSG_ACK //响应消息
+        MSG_SYNC //同步消息
+        MSG_DIRECT  //直接请求消息，无需响应，消息接收者调用handler
+    }
+
+    struct Identity {
+        serviceId : int16
+        featureId : int16
+        queueId : MQueueId
+    }
+
+    struct Request {
+        msgId : int16
+        len : int16
+        data : void *
+        msgValue : uint32
+    }
+
+    struct Response {
+        data : void *
+        len : int16
+    }
+
+    TaskPool --> Exchange : 消息队列所交换的信息
+    Exchange --> Identity 
+    Exchange --> ExchangeType
+    Exchange --> Request
+    Exchange --> Response
+
+    note left of TaskPool::SAMGR_CreateFixedTaskPool
+    为每一个服务创建消息队列和任务池
+    end note
+    note left of TaskPool::SAMGR_StartTaskPool
+    创建并运行监控线程,通过以下代码塞一个TaskEntry()，线程启动后运行TaskEntry()
+    register ThreadId threadId = (ThreadId)THREAD_Create(TaskEntry, pool->queueId, &attr);
+    end note
+    note left of TaskPool::TaskEntry
+    循环监听消息队列
+    调用ProcResponse,ProcDirectRequest,ProcRequest等进行消息处理
+    end note
+    note left of TaskPool::ProcResponse
+    处理MSG_ACK响应消息
+    调用Exchange的handler函数处理消息
+    end note
+    note left of TaskPool::ProcDirectRequest
+    处理MSG_DIRECT响应消息
+    调用Exchange的handler函数处理消息
+    end note
+    note left of TaskPool::ProcRequest
+    处理MSG_NON/MSG_CON响应消息
+    调用服务或特性的MessageHandle()函数处理消息
+    end note
+
+    note left of Exchange::Identity
+    消息接收者的身份信息
+    end note
+    note left of Exchange::Request
+    请求消息的主题
+    end note
+    note left of Exchange::Response
+    响应消息的主题
+    end note
+    note left of Exchange::type
+    消息的类型
+    end note
+    note left of Exchange::handler
+    请求消息的消息处理函数或响应消息的异步响应回调函数
+    end note
+    note left of Exchange::sharedRef
+    用以计数，指明request或response的data的引用次数
+    end note
+
+    note right of Identity::queueId
+    消息发送者的消息队列ID，消息接收者向该ID发送响应消息
+    end note
+
+    note bottom of Response
+    data指向共享内存的空间首地址
+    len为数据长度
+    end note
+
+    note bottom of Request
+    两类数据传输方式：
+    一种共享内存（利用data,len字段，data指向共享内存的空间首地址，len为data的长度）
+    一种利用msgID,msgValue（例如Bootstrap，Hiview，broadcast的pub_sub_feature）
+    end note
+```
+
+消息队列的底层POSIX,CMSIS两类实现
+
+```plantuml
+    !theme plain
+    package adpter{
+        file memory_adapter
+        file queue_adapter
+        file thread_adapter
+        file time_adapter
+        file build.gn
+        package posix
+        package cmsis
+
+        posix --|>memory_adapter
+        posix --|>queue_adapter
+        posix --|>thread_adapter
+        posix --|>time_adapter
+
+        cmsis --|>memory_adapter
+        cmsis --|>queue_adapter
+        cmsis --|>thread_adapter
+        cmsis --|>time_adapter
+
+        note top of build.gn
+        根据ohos_kernel_type决定构建的依赖
+        liteos_m内核则链接cmsis包下的源文件
+        liteos_a或linux内核则链接posix包下的源文件
+        end note
+    }
+```
+
+```plantUML
+    !theme plain
+    hide empty members
+    Struct MQueue{
+        QUEUE_Create()
+        QUEUE_Put()
+        QUEUE_Pop()
+        QUEUE_Destroy()
+    }
+```
+
+#### CMSIS实现
+
+CMSIS实现调用osMessageQueueNew, osMessageQueuePut, osMessageQueueGet, osMessageQueueDelete等API
+
+```code
+MQueueId QUEUE_Create(const char *name, int size, int count)
+{
+    osMessageQueueAttr_t queueAttr = {name, 0, NULL, 0, NULL, 0};
+    return (MQueueId)osMessageQueueNew(count, size, &queueAttr);
+}
+
+int QUEUE_Put(MQueueId queueId, const void *element, uint8 pri, int timeout)
+{
+    uint32_t waitTime = (timeout <= 0) ? 0 : (uint32_t)timeout;
+    osStatus_t ret = osMessageQueuePut(queueId, element, pri, waitTime);
+    if (ret != osOK) {
+        return EC_BUSBUSY;
+    }
+    return EC_SUCCESS;
+}
+
+int QUEUE_Pop(MQueueId queueId, void *element, uint8 *pri, int timeout)
+{
+    uint32_t waitTime = (timeout <= 0) ? osWaitForever : (uint32_t)timeout;
+    osStatus_t evt = osMessageQueueGet(queueId, element, pri, waitTime);
+    if (evt != osOK) {
+        return EC_BUSBUSY;
+    }
+    return EC_SUCCESS;
+}
+
+int QUEUE_Destroy(MQueueId queueId)
+{
+    osStatus_t evt = osMessageQueueDelete(queueId);
+    if (evt != osOK) {
+        return EC_FAILURE;
+    }
+    return EC_SUCCESS;
+}
+```
+
+kernel/liteos_m/kal/cmsis/cmsis_liteos2.c
+
+```code
+osMessageQueueId_t osMessageQueueNew(uint32_t msg_count, uint32_t msg_size, const osMessageQueueAttr_t *attr)
+{
+    UINT32 uwQueueID;
+    UINT32 uwRet;
+    UNUSED(attr);
+    osMessageQueueId_t handle;
+
+    if (0 == msg_count || 0 == msg_size || OS_INT_ACTIVE) {
+        return (osMessageQueueId_t)NULL;
+    }
+
+    uwRet = LOS_QueueCreate((char *)NULL, (UINT16)msg_count, &uwQueueID, 0, (UINT16)msg_size);
+    if (uwRet == LOS_OK) {
+        handle = (osMessageQueueId_t)(GET_QUEUE_HANDLE(uwQueueID));
+    } else {
+        handle = (osMessageQueueId_t)NULL;
+    }
+
+    return handle;
+}
+
+
+osStatus_t osMessageQueuePut(osMessageQueueId_t mq_id, const void *msg_ptr, uint8_t msg_prio, uint32_t timeout)
+{
+    UNUSED(msg_prio);
+    UINT32 uwRet;
+    UINT32 uwBufferSize;
+    LosQueueCB *pstQueue = (LosQueueCB *)mq_id;
+
+    if (pstQueue == NULL || msg_ptr == NULL || ((OS_INT_ACTIVE) && (0 != timeout))) {
+        return osErrorParameter;
+    }
+    if (pstQueue->queueSize < sizeof(UINT32)) {
+        return osErrorParameter;
+    }
+    uwBufferSize = (UINT32)(pstQueue->queueSize - sizeof(UINT32));
+    uwRet = LOS_QueueWriteCopy((UINT32)pstQueue->queueID, (void *)msg_ptr, uwBufferSize, timeout);
+    if (uwRet == LOS_OK) {
+        return osOK;
+    } else if (uwRet == LOS_ERRNO_QUEUE_INVALID || uwRet == LOS_ERRNO_QUEUE_NOT_CREATE) {
+        return osErrorParameter;
+    } else if (uwRet == LOS_ERRNO_QUEUE_TIMEOUT) {
+        return osErrorTimeout;
+    } else {
+        return osErrorResource;
+    }
+}
+
+
+osStatus_t osMessageQueueGet(osMessageQueueId_t mq_id, void *msg_ptr, uint8_t *msg_prio, uint32_t timeout)
+{
+    UNUSED(msg_prio);
+    UINT32 uwRet;
+    UINT32 uwBufferSize;
+    LosQueueCB *pstQueue = (LosQueueCB *)mq_id;
+
+    if (pstQueue == NULL || msg_ptr == NULL || ((OS_INT_ACTIVE) && (0 != timeout))) {
+        return osErrorParameter;
+    }
+
+    uwBufferSize = (UINT32)(pstQueue->queueSize - sizeof(UINT32));
+    uwRet = LOS_QueueReadCopy((UINT32)pstQueue->queueID, msg_ptr, &uwBufferSize, timeout);
+    if (uwRet == LOS_OK) {
+        return osOK;
+    } else if (uwRet == LOS_ERRNO_QUEUE_INVALID || uwRet == LOS_ERRNO_QUEUE_NOT_CREATE) {
+        return osErrorParameter;
+    } else if (uwRet == LOS_ERRNO_QUEUE_TIMEOUT) {
+        return osErrorTimeout;
+    } else {
+        return osErrorResource;
+    }
+}
+```
+
+kernel/liteos_m/kernel/src/los_queue.c
+```code
+
+
+/**************************************************************************
+ Function    : OsQueueInit
+ Description : queue initial
+ Input       : None
+ Output      : None
+ Return      : LOS_OK on success or error code on failure
+**************************************************************************/
+LITE_OS_SEC_TEXT_INIT UINT32 OsQueueInit(VOID)
+{
+    LosQueueCB *queueNode = NULL;
+    UINT16 index;
+
+    if (LOSCFG_BASE_IPC_QUEUE_LIMIT == 0) {
+        return LOS_ERRNO_QUEUE_MAXNUM_ZERO;
+    }
+
+    g_allQueue = (LosQueueCB *)LOS_MemAlloc(m_aucSysMem0, LOSCFG_BASE_IPC_QUEUE_LIMIT * sizeof(LosQueueCB));
+    if (g_allQueue == NULL) {
+        return LOS_ERRNO_QUEUE_NO_MEMORY;
+    }
+
+    (VOID)memset_s(g_allQueue, LOSCFG_BASE_IPC_QUEUE_LIMIT * sizeof(LosQueueCB),
+                   0, LOSCFG_BASE_IPC_QUEUE_LIMIT * sizeof(LosQueueCB));
+
+    LOS_ListInit(&g_freeQueueList);
+    for (index = 0; index < LOSCFG_BASE_IPC_QUEUE_LIMIT; index++) {
+        queueNode = ((LosQueueCB *)g_allQueue) + index;
+        queueNode->queueID = index;
+        LOS_ListTailInsert(&g_freeQueueList, &queueNode->readWriteList[OS_QUEUE_WRITE]);
+    }
+
+    return LOS_OK;
+}
+
+/*****************************************************************************
+ Function    : LOS_QueueCreate
+ Description : Create a queue
+ Input       : queueName  --- Queue name, less than 4 characters
+             : len        --- Queue length
+             : flags      --- Queue type, FIFO or PRIO
+             : maxMsgSize --- Maximum message size in byte
+ Output      : queueID    --- Queue ID
+ Return      : LOS_OK on success or error code on failure
+ *****************************************************************************/
+LITE_OS_SEC_TEXT_INIT UINT32 LOS_QueueCreate(CHAR *queueName,
+                                             UINT16 len,
+                                             UINT32 *queueID,
+                                             UINT32 flags,
+                                             UINT16 maxMsgSize)
+{
+    LosQueueCB *queueCB = NULL;
+    UINT32 intSave;
+    LOS_DL_LIST *unusedQueue = NULL;
+    UINT8 *queue = NULL;
+    UINT16 msgSize;
+
+    (VOID)queueName;
+    (VOID)flags;
+
+    if (queueID == NULL) {
+        return LOS_ERRNO_QUEUE_CREAT_PTR_NULL;
+    }
+
+    if (maxMsgSize > (OS_NULL_SHORT - sizeof(UINT32))) {
+        return LOS_ERRNO_QUEUE_SIZE_TOO_BIG;
+    }
+
+    if ((len == 0) || (maxMsgSize == 0)) {
+        return LOS_ERRNO_QUEUE_PARA_ISZERO;
+    }
+    msgSize = maxMsgSize + sizeof(UINT32);
+
+    /* Memory allocation is time-consuming, to shorten the time of disable interrupt,
+       move the memory allocation to here. */
+    queue = (UINT8 *)LOS_MemAlloc(m_aucSysMem0, len * msgSize);
+    if (queue == NULL) {
+        return LOS_ERRNO_QUEUE_CREATE_NO_MEMORY;
+    }
+
+    intSave = LOS_IntLock();
+    if (LOS_ListEmpty(&g_freeQueueList)) {
+        LOS_IntRestore(intSave);
+        (VOID)LOS_MemFree(m_aucSysMem0, queue);
+        return LOS_ERRNO_QUEUE_CB_UNAVAILABLE;
+    }
+
+    unusedQueue = LOS_DL_LIST_FIRST(&(g_freeQueueList));
+    LOS_ListDelete(unusedQueue);
+    queueCB = (GET_QUEUE_LIST(unusedQueue));
+    queueCB->queueLen = len;
+    queueCB->queueSize = msgSize;
+    queueCB->queue = queue;
+    queueCB->queueState = OS_QUEUE_INUSED;
+    queueCB->readWriteableCnt[OS_QUEUE_READ] = 0;
+    queueCB->readWriteableCnt[OS_QUEUE_WRITE] = len;
+    queueCB->queueHead = 0;
+    queueCB->queueTail = 0;
+    LOS_ListInit(&queueCB->readWriteList[OS_QUEUE_READ]);
+    LOS_ListInit(&queueCB->readWriteList[OS_QUEUE_WRITE]);
+    LOS_ListInit(&queueCB->memList);
+    LOS_IntRestore(intSave);
+
+    *queueID = queueCB->queueID;
+
+    OsHookCall(LOS_HOOK_TYPE_QUEUE_CREATE, queueCB);
+
+    return LOS_OK;
+}
+
+```
+
+
+#### POSIX实现
+
+```code
+struct LockFreeBlockQueue {
+    pthread_mutex_t wMutex;
+    pthread_mutex_t rMutex;
+    pthread_cond_t cond;
+    LockFreeQueue *queue;
+};
+struct LockFreeQueue {
+    uint32 write;
+    uint32 read;
+    uint32 itemSize;
+    uint32 totalSize;
+    uint8 buffer[0];
+};
+```
