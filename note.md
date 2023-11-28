@@ -802,252 +802,356 @@ SYS_FEATURE_INIT(Init);
 
 #### CMSIS实现
 
-CMSIS实现调用osMessageQueueNew, osMessageQueuePut, osMessageQueueGet, osMessageQueueDelete等API
-
-```code
-MQueueId QUEUE_Create(const char *name, int size, int count)
-{
-    osMessageQueueAttr_t queueAttr = {name, 0, NULL, 0, NULL, 0};
-    return (MQueueId)osMessageQueueNew(count, size, &queueAttr);
-}
-
-int QUEUE_Put(MQueueId queueId, const void *element, uint8 pri, int timeout)
-{
-    uint32_t waitTime = (timeout <= 0) ? 0 : (uint32_t)timeout;
-    osStatus_t ret = osMessageQueuePut(queueId, element, pri, waitTime);
-    if (ret != osOK) {
-        return EC_BUSBUSY;
-    }
-    return EC_SUCCESS;
-}
-
-int QUEUE_Pop(MQueueId queueId, void *element, uint8 *pri, int timeout)
-{
-    uint32_t waitTime = (timeout <= 0) ? osWaitForever : (uint32_t)timeout;
-    osStatus_t evt = osMessageQueueGet(queueId, element, pri, waitTime);
-    if (evt != osOK) {
-        return EC_BUSBUSY;
-    }
-    return EC_SUCCESS;
-}
-
-int QUEUE_Destroy(MQueueId queueId)
-{
-    osStatus_t evt = osMessageQueueDelete(queueId);
-    if (evt != osOK) {
-        return EC_FAILURE;
-    }
-    return EC_SUCCESS;
-}
-```
-
-kernel/liteos_m/kal/cmsis/cmsis_liteos2.c
-
-```code
-osMessageQueueId_t osMessageQueueNew(uint32_t msg_count, uint32_t msg_size, const osMessageQueueAttr_t *attr)
-{
-    UINT32 uwQueueID;
-    UINT32 uwRet;
-    UNUSED(attr);
-    osMessageQueueId_t handle;
-
-    if (0 == msg_count || 0 == msg_size || OS_INT_ACTIVE) {
-        return (osMessageQueueId_t)NULL;
-    }
-
-    uwRet = LOS_QueueCreate((char *)NULL, (UINT16)msg_count, &uwQueueID, 0, (UINT16)msg_size);
-    if (uwRet == LOS_OK) {
-        handle = (osMessageQueueId_t)(GET_QUEUE_HANDLE(uwQueueID));
-    } else {
-        handle = (osMessageQueueId_t)NULL;
-    }
-
-    return handle;
-}
-
-
-osStatus_t osMessageQueuePut(osMessageQueueId_t mq_id, const void *msg_ptr, uint8_t msg_prio, uint32_t timeout)
-{
-    UNUSED(msg_prio);
-    UINT32 uwRet;
-    UINT32 uwBufferSize;
-    LosQueueCB *pstQueue = (LosQueueCB *)mq_id;
-
-    if (pstQueue == NULL || msg_ptr == NULL || ((OS_INT_ACTIVE) && (0 != timeout))) {
-        return osErrorParameter;
-    }
-    if (pstQueue->queueSize < sizeof(UINT32)) {
-        return osErrorParameter;
-    }
-    uwBufferSize = (UINT32)(pstQueue->queueSize - sizeof(UINT32));
-    uwRet = LOS_QueueWriteCopy((UINT32)pstQueue->queueID, (void *)msg_ptr, uwBufferSize, timeout);
-    if (uwRet == LOS_OK) {
-        return osOK;
-    } else if (uwRet == LOS_ERRNO_QUEUE_INVALID || uwRet == LOS_ERRNO_QUEUE_NOT_CREATE) {
-        return osErrorParameter;
-    } else if (uwRet == LOS_ERRNO_QUEUE_TIMEOUT) {
-        return osErrorTimeout;
-    } else {
-        return osErrorResource;
-    }
-}
-
-
-osStatus_t osMessageQueueGet(osMessageQueueId_t mq_id, void *msg_ptr, uint8_t *msg_prio, uint32_t timeout)
-{
-    UNUSED(msg_prio);
-    UINT32 uwRet;
-    UINT32 uwBufferSize;
-    LosQueueCB *pstQueue = (LosQueueCB *)mq_id;
-
-    if (pstQueue == NULL || msg_ptr == NULL || ((OS_INT_ACTIVE) && (0 != timeout))) {
-        return osErrorParameter;
-    }
-
-    uwBufferSize = (UINT32)(pstQueue->queueSize - sizeof(UINT32));
-    uwRet = LOS_QueueReadCopy((UINT32)pstQueue->queueID, msg_ptr, &uwBufferSize, timeout);
-    if (uwRet == LOS_OK) {
-        return osOK;
-    } else if (uwRet == LOS_ERRNO_QUEUE_INVALID || uwRet == LOS_ERRNO_QUEUE_NOT_CREATE) {
-        return osErrorParameter;
-    } else if (uwRet == LOS_ERRNO_QUEUE_TIMEOUT) {
-        return osErrorTimeout;
-    } else {
-        return osErrorResource;
-    }
-}
-```
-
-kernel/liteos_m/kernel/src/los_queue.c
-```code
-
-
-/**************************************************************************
- Function    : OsQueueInit
- Description : queue initial
- Input       : None
- Output      : None
- Return      : LOS_OK on success or error code on failure
-**************************************************************************/
-LITE_OS_SEC_TEXT_INIT UINT32 OsQueueInit(VOID)
-{
-    LosQueueCB *queueNode = NULL;
-    UINT16 index;
-
-    if (LOSCFG_BASE_IPC_QUEUE_LIMIT == 0) {
-        return LOS_ERRNO_QUEUE_MAXNUM_ZERO;
-    }
-
-    g_allQueue = (LosQueueCB *)LOS_MemAlloc(m_aucSysMem0, LOSCFG_BASE_IPC_QUEUE_LIMIT * sizeof(LosQueueCB));
-    if (g_allQueue == NULL) {
-        return LOS_ERRNO_QUEUE_NO_MEMORY;
-    }
-
-    (VOID)memset_s(g_allQueue, LOSCFG_BASE_IPC_QUEUE_LIMIT * sizeof(LosQueueCB),
-                   0, LOSCFG_BASE_IPC_QUEUE_LIMIT * sizeof(LosQueueCB));
-
-    LOS_ListInit(&g_freeQueueList);
-    for (index = 0; index < LOSCFG_BASE_IPC_QUEUE_LIMIT; index++) {
-        queueNode = ((LosQueueCB *)g_allQueue) + index;
-        queueNode->queueID = index;
-        LOS_ListTailInsert(&g_freeQueueList, &queueNode->readWriteList[OS_QUEUE_WRITE]);
-    }
-
-    return LOS_OK;
-}
-
-/*****************************************************************************
- Function    : LOS_QueueCreate
- Description : Create a queue
- Input       : queueName  --- Queue name, less than 4 characters
-             : len        --- Queue length
-             : flags      --- Queue type, FIFO or PRIO
-             : maxMsgSize --- Maximum message size in byte
- Output      : queueID    --- Queue ID
- Return      : LOS_OK on success or error code on failure
- *****************************************************************************/
-LITE_OS_SEC_TEXT_INIT UINT32 LOS_QueueCreate(CHAR *queueName,
-                                             UINT16 len,
-                                             UINT32 *queueID,
-                                             UINT32 flags,
-                                             UINT16 maxMsgSize)
-{
-    LosQueueCB *queueCB = NULL;
-    UINT32 intSave;
-    LOS_DL_LIST *unusedQueue = NULL;
-    UINT8 *queue = NULL;
-    UINT16 msgSize;
-
-    (VOID)queueName;
-    (VOID)flags;
-
-    if (queueID == NULL) {
-        return LOS_ERRNO_QUEUE_CREAT_PTR_NULL;
-    }
-
-    if (maxMsgSize > (OS_NULL_SHORT - sizeof(UINT32))) {
-        return LOS_ERRNO_QUEUE_SIZE_TOO_BIG;
-    }
-
-    if ((len == 0) || (maxMsgSize == 0)) {
-        return LOS_ERRNO_QUEUE_PARA_ISZERO;
-    }
-    msgSize = maxMsgSize + sizeof(UINT32);
-
-    /* Memory allocation is time-consuming, to shorten the time of disable interrupt,
-       move the memory allocation to here. */
-    queue = (UINT8 *)LOS_MemAlloc(m_aucSysMem0, len * msgSize);
-    if (queue == NULL) {
-        return LOS_ERRNO_QUEUE_CREATE_NO_MEMORY;
-    }
-
-    intSave = LOS_IntLock();
-    if (LOS_ListEmpty(&g_freeQueueList)) {
-        LOS_IntRestore(intSave);
-        (VOID)LOS_MemFree(m_aucSysMem0, queue);
-        return LOS_ERRNO_QUEUE_CB_UNAVAILABLE;
-    }
-
-    unusedQueue = LOS_DL_LIST_FIRST(&(g_freeQueueList));
-    LOS_ListDelete(unusedQueue);
-    queueCB = (GET_QUEUE_LIST(unusedQueue));
-    queueCB->queueLen = len;
-    queueCB->queueSize = msgSize;
-    queueCB->queue = queue;
-    queueCB->queueState = OS_QUEUE_INUSED;
-    queueCB->readWriteableCnt[OS_QUEUE_READ] = 0;
-    queueCB->readWriteableCnt[OS_QUEUE_WRITE] = len;
-    queueCB->queueHead = 0;
-    queueCB->queueTail = 0;
-    LOS_ListInit(&queueCB->readWriteList[OS_QUEUE_READ]);
-    LOS_ListInit(&queueCB->readWriteList[OS_QUEUE_WRITE]);
-    LOS_ListInit(&queueCB->memList);
-    LOS_IntRestore(intSave);
-
-    *queueID = queueCB->queueID;
-
-    OsHookCall(LOS_HOOK_TYPE_QUEUE_CREATE, queueCB);
-
-    return LOS_OK;
-}
+QUEUE_Create调用链：
+```plantuml
+    !theme plain
+    QUEUE_Create -> KAL内核抽象层 :  调用osMessageQueueNew(),\n设置其size,count,name等属性（但其他属性UNUSED掉了)
+    activate KAL内核抽象层
+    KAL内核抽象层 -> los_queue : 调用LOS_QueueCreate()创建消息队列，\n其由LosQueueCB管理
+    activate los_queue
+    los_queue -> los_memory : 调用LOS_MemAlloc()在指定内存池为\n消息队列分配内存
+    activate los_memory
+    los_memory --> los_queue : 分配的内存指针
+    deactivate los_memory
+    los_queue --> KAL内核抽象层 : 分配成功或失败的信息
+    deactivate los_queue
+    KAL内核抽象层 --> QUEUE_Create : 如果成功返回message queue ID，如果失败返回null
+    deactivate KAL内核抽象层 
 
 ```
+
+```code
+typedef struct 
+{
+    UINT8       *queueHandle;                    /* 队列指针 */
+    UINT8       queueState;                      /* 队列状态 */
+    UINT8       queueMemType;                    /* 创建队列时内存分配的方式 */
+    UINT16      queueLen;                        /* 队列中消息节点个数，即队列长度 */
+    UINT16      queueSize;                       /* 消息节点大小 */
+    UINT32      queueID;                         /* 队列ID */
+    UINT16      queueHead;                       /* 消息头节点位置（数组下标）*/
+    UINT16      queueTail;                       /* 消息尾节点位置（数组下标）*/
+    UINT16      readWriteableCnt[OS_QUEUE_N_RW]; /* 数组下标0的元素表示队列中可读消息数，                              
+                                                    数组下标1的元素表示队列中可写消息数 */
+    LOS_DL_LIST readWriteList[OS_QUEUE_N_RW];    /* 读取或写入消息的任务等待链表， 
+                                                    下标0：读取链表，下标1：写入链表 */
+    LOS_DL_LIST memList;                         /* CMSIS-RTOS中的MailBox模块使用的内存块链表 */
+} LosQueueCB;
+
+```
+
+QUEUE_Put调用链：
+
+```plantuml
+!theme plain
+participant "Client" as Client
+participant "QUEUE_Put" as QueuePut
+participant "osMessageQueuePut" as OsMsgQueuePut
+participant "LOS_QueueWriteCopy" as LOSQueueWriteCopy
+participant "OsQueueOperate" as OsQueueOperate
+
+Client -> QueuePut : 设置队列ID, 元素, 优先级, 允许的超时时间\n源代码中所有该调用皆为DONT_WAIT
+activate QueuePut
+
+QueuePut -> OsMsgQueuePut : 设置队列ID, 元素, 优先级, 计算后的超时
+activate OsMsgQueuePut
+
+OsMsgQueuePut -> LOSQueueWriteCopy : 设置队列ID, 元素, 缓冲区大小, 超时时间
+activate LOSQueueWriteCopy
+
+LOSQueueWriteCopy -> OsQueueOperate : 设置队列ID, 操作类型, 缓冲区地址, 缓冲区大小, 超时时间\n操作类型为写队列尾部且为非指针操作，这意味着会调用memcpy_s复制整个内存
+activate OsQueueOperate
+
+OsQueueOperate --> LOSQueueWriteCopy : 返回状态
+deactivate OsQueueOperate
+
+LOSQueueWriteCopy --> OsMsgQueuePut : 返回状态
+deactivate LOSQueueWriteCopy
+
+alt 如果返回LOS_OK
+    OsMsgQueuePut --> QueuePut : 返回osOK
+    deactivate OsMsgQueuePut
+    QueuePut --> Client : 返回EC_SUCCESS
+else 如果发生错误
+    OsMsgQueuePut --> QueuePut : 返回错误状态
+    deactivate OsMsgQueuePut
+    QueuePut --> Client : 返回EC_BUSBUSY
+end
+
+deactivate QueuePut
+
+```
+
 
 
 #### POSIX实现
 
-```code
+生产者-消费者模型
+
+>生产者消费者模式是一种常见的并发设计模式，用于处理在多线程环境下不同进程或线程间的数据共享和同步。在这个模式中，生产者负责生成数据，消费者负责处理数据。关键点在于生产者和消费者的处理速度可能不同，因此需要一种机制来平衡它们之间的速率差异。
+>
+>主要组件
+>生产者（Producer）：负责生成数据，并将其放入缓冲区。生产者可以是一个或多个线程。
+>
+>消费者（Consumer）：从缓冲区中取出数据并处理它。消费者也可以是一个或多个线程。
+>
+>缓冲区（Buffer）：临时存储生产者生成的数据，等待消费者处理。缓冲区可以是有限的（有最大容量限制）或无限的。
+>
+>关键特点
+>同步机制：由于生产者和消费者通常以不同的速率运行，因此需要同步机制来协调它们的工作。这通常通过锁（如互斥锁）和信号（如条件变量）实现。
+>
+>阻塞和唤醒：当缓冲区为空时，消费者线程可能会被阻塞，直到有新数据加入缓冲区。类似地，当缓冲区满时，生产者线程可能会被阻塞，直到消费者取走一些数据。
+
+```plantUML
+!theme plain
+hide empty members
+
 struct LockFreeBlockQueue {
-    pthread_mutex_t wMutex;
-    pthread_mutex_t rMutex;
-    pthread_cond_t cond;
-    LockFreeQueue *queue;
-};
+    wMutex : pthread_mutex_t
+    rMutex : pthread_mutex_t
+    cond : pthread_cond_t
+    queue : LockFreeQueue
+}
 struct LockFreeQueue {
-    uint32 write;
-    uint32 read;
-    uint32 itemSize;
-    uint32 totalSize;
-    uint8 buffer[0];
-};
+    write: uint32
+    read: uint32
+    itemSize: uint32
+    totalSize: uint32
+    buffer: uint8
+}
+
+LockFreeBlockQueue -> LockFreeQueue
+
+note left of LockFreeBlockQueue::wMutex
+POSIX 线程（pthreads）库的互斥锁
+end note
+
+note left of LockFreeBlockQueue::cond
+POSIX 线程（pthreads）库的条件变量，
+支持Wait，Signal，Broadcast操作
+end note
+
 ```
+
+```plantuml
+
+!theme plain
+
+start
+
+:接收参数queueId, element, pri, timeout;
+if (参数检查) then (失败)
+  :返回 EC_INVALID;
+  stop
+else (成功)
+endif
+
+partition "QUEUE_Put" {
+  :锁定 wMutex;
+  :执行 LFQUE_Push;
+  :解锁 wMutex;
+  :锁定 rMutex;
+  :发出条件变量信号;
+  :解锁 rMutex;
+  :返回操作结果;
+}
+stop
+
+```
+
+```plantuml
+
+!theme plain
+
+start
+
+partition "QUEUE_Pop" {
+  :尝试 LFQUE_Pop;
+  if (操作成功?) then (是)
+    :返回 EC_SUCCESS;
+    stop
+  else (否)
+  endif
+
+  :锁定 rMutex;
+  while (LFQUE_Pop 不成功?) is (是)
+    :等待条件变量;
+  endwhile
+  :解锁 rMutex;
+  :返回 EC_SUCCESS;
+}
+
+stop
+
+```
+
+## 进程间通信
+```plantuml
+!theme plain
+hide empty members
+
+class RemoteRegister {
+    - mtx : MutexId
+    - clients : Vector
+    - endpoint : Endpoint
+}
+
+class Endpoint {
+    - name : char
+    - routers : Vector
+    - boss : ThreadId
+    - deadId : uint32
+    - running : int
+    - registerEP : RegisterEndpoint
+    - bucket : TokenBucket
+    - context : IpcContext
+    - identity : SvcIdentity
+}
+
+class SvcIdentity {
+    - handle : uint32_t
+    - token : uint32_t
+    - cookie : uint32_t
+    - ipcContext : IpcContext
+}
+
+class Router {
+    - policyNum : uint32
+    - saName : SaName
+    - identity : Identity
+    - proxy : IServerProxy
+    - policy : PolicyTrans
+}
+
+class IpcContext{
+    - fd : int //文件描述符
+    - mmapSize : size_t //Memory Map Size
+    - mmapAddr : void* //Memory Map Address
+}
+
+RemoteRegister --* Endpoint
+Endpoint --*  SvcIdentity
+Endpoint --*  IpcContext
+Endpoint --*  Router : routers.data[x]
+
+note left of SvcIdentity
+本Endpooint的身份信息
+end note
+note left of Endpoint
+每个进程对应一个Endpoint，
+用以维护boss线程，其用以IPC
+end note
+note right of Router
+某个进程对外提供服务或特性的服务单元
+end note
+note right of RemoteRegister
+某个进程维护一个g_remoteRegister全局变量
+end note
+
+note right of Endpoint::name
+客户端Endpoint的名字为ipc client,samgr Endpoint的名字为samgr
+end note
+
+note right of Endpoint::boss 
+Endpoint用于进程间通信的线程的句柄
+end note
+
+note right of Endpoint::RegisterEndpoint
+函数指针指向Enpoint向服务管理者注册自己的注册函数，
+客户端Endpoint为RegisterRemoteEndpoint(),
+samgr Endpoint为RegisterSamgrEndpoint()
+end note
+
+
+
+
+```
+### IPC概要
+
+```plantuml
+!theme plain
+hide empty members
+
+class Endpoint {
+}
+
+class SamgrEP extends Endpoint {
+}
+
+class IpcClientA extends Endpoint {
+}
+
+class IpcClientB extends Endpoint {
+}
+
+note left of SamgrEP
+全局唯一
+由SamgrServer g_server维护
+end note
+```
+
+
+```plantuml
+!theme plain
+hide empty members
+
+class SamgrEP  {
+}
+
+class IpcClientA {
+}
+
+class IpcClientB {
+}
+
+IpcClientA -down-> SamgrEP : 注册boss的Tid\n注册Router列表
+IpcClientB -down-> SamgrEP : 查询IpcClientA的handle，Router的token\n而后进行IPC
+
+```
+
+### Endpoint注册流程
+```plantuml
+!theme plain
+    :服务或特性初始化时其消息队列会收到
+    MSG_DIRECT的消息，该消息由HandleInitRequest()处理;
+    :调用DEFAULT_Initialize(serviceImpl)初始化各服务和特性;
+    :调用服务的生命周期函数Initialize()、OnInitialize()进行初始化;
+    :调用SAMGR_RegisterServiceApi()进行服务接口注册;
+    :InitializeRegistry()初始化RemoteRegister;
+    group 初始化RemoteRegister
+    :调用MUTEX_InitValue()创建互斥量;
+    :调用VECTOR_Make()创建空Vector;
+    :调用SAMGR_CreateEndpoint()创建名为"ipc client"的Endpoint;
+    group 初始化Endpoint
+    :调用OpenLiteIpc()初始化context该函数，
+    包含打开设备驱动文件(如/dev/binder）,创建内存映射两步;
+    :初始化其它成员变量，boss、identity的成员变量置为Null或INVALID_INDEX，
+    它们将在后续步骤中进行真正的初始化;
+    end group
+    end group
+
+    :调用SAMGR_AddRouter()注册Router;
+    group 注册Router
+
+
+
+
+```
+
+>### 打开设备驱动文件
+>设备驱动文件：在类 Unix 系统（如 Linux）中，设备驱动文件通常位于 /dev 目录下。它们是特殊的文件，提供了用户空间程序与硬件设备或虚拟设备交互的接口。通过这些文件，程序可以读取或写入设备，或者执行特定的控制操作。
+>
+>打开过程：打开设备驱动文件通常涉及到调用如 open 的系统调用。这个调用需要设备文件的路径和所需的访问模式（如只读、只写或读写）。成功的 open 调用返回一个文件描述符（fd），这是一个整数值，用于后续的读写或控制操作。
+>
+>用途：这个过程通常用于与特定的硬件设备通信，比如读取传感器数据，控制图形显示设备，或者与网络接口交互。在 IPC (进程间通信) 的上下文中，这可能涉及到打开一个代表某种通信机制（如管道、消息队列）的特殊文件。
+>
+>### 创建内存映射
+>内存映射（Memory Mapping）：内存映射是一种内存管理技术，它允许程序将一部分磁盘文件映射到其地址空间。通过这种方式，文件内容可以像访问普通内存一样直接访问，这样可以提高文件操作的效率，并且支持进程间共享内存。
+>
+>创建过程：在类 Unix 系统中，这通常通过 mmap 系统调用实现。mmap 调用需要文件描述符、映射区域的大小、期望的保护级别（如是否可读写）、映射类型（共享或私有）等参数。成功调用 mmap 后，它返回一个指向映射区域开始位置的指针。
+>
+>用途：内存映射常用于高效文件访问，以及在多个进程之间共享内存。在 IPC 上下文中，内存映射可以用来创建一个共享的内存区域，让多个进程可以读写同一块内存，从而实现数据共享和通信。
+
+### IpcClient与samgr EP的IPC
+
+### IpcClient之间的IPC
