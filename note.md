@@ -29,9 +29,9 @@ samgr_lite：系统服务框架基于面向服务的架构，提供了服务开�
     folder dmsfwk_lite
     folder safwk_lite
     folder samgr_lite
-    dmsfwk_lite <-- 分布式框架
-    safwk_lite <-right- samgr_lite
-    samgr_lite <-- 服务管理
+    ' dmsfwk_lite <-- 分布式框架
+    ' safwk_lite <-right- samgr_lite
+    ' samgr_lite <-- 服务管理
 
 ```
 
@@ -985,7 +985,7 @@ stop
 
 ```
 
-## 进程间通信
+## 进程间通信（IPC）
 ```plantuml
 !theme plain
 hide empty members
@@ -1009,18 +1009,18 @@ class Endpoint {
 }
 
 class SvcIdentity {
-    - handle : uint32_t
-    - token : uint32_t
-    - cookie : uint32_t
-    - ipcContext : IpcContext
+    handle : uint32_t //本Endpoint的boss线程ID在内核的映射后得到的一个句柄
+    token : uint32_t //其它Endpoint访问本Endpoint的routers.data[token]获取Router
+    cookie : uint32_t
+    ipcContext : IpcContext //Linux内核的IPC上下文
 }
 
 class Router {
-    - policyNum : uint32
-    - saName : SaName
-    - identity : Identity
-    - proxy : IServerProxy
-    - policy : PolicyTrans
+    policyNum : uint32 
+    saName : SaName //{服务名字，特性名字}
+    identity : Identity //{Sid,Fid,Qid}
+    proxy : IServerProxy //服务或特性的IUnknown
+    policy : PolicyTrans
 }
 
 class IpcContext{
@@ -1045,7 +1045,11 @@ note right of Router
 某个进程对外提供服务或特性的服务单元
 end note
 note right of RemoteRegister
-某个进程维护一个g_remoteRegister全局变量
+每个进程维护一个g_remoteRegister全局变量
+end note
+
+note left of Router::proxy
+对外提供的服务或特性
 end note
 
 note right of Endpoint::name
@@ -1132,11 +1136,183 @@ IpcClientB -down-> SamgrEP : 查询IpcClientA的handle，Router的token\n而后�
 
     :调用SAMGR_AddRouter()注册Router;
     group 注册Router
-
-
+    :为服务或特性对外提供的接口创建一个Router对象并初始化;
+    :将Router对象的指针添加到endpoint->routers向量中;
+    :调用Listen()为当前EndPoint创建boss线程并开始监听消息队列，
+    使用THREAD_Create()新建线程，
+    线程优先级为PRI_ABOVE_NORMAL,高于普通线程的优先级，
+    其线程入口函数为Receive();
+    end group
+    group boss线程的Receive()函数
+    group 远程注册Endpoint
+    :对于客户端Endpoint，调用RegisterRemoteEndpoint()远程注册Endpoint;
+    :新生成的客户端Endpoint向服务管理者SamgrServer g_server注册,
+    通过Transact()函数发送IPC消息给samgr EP，
+    将Endpoint加入到其g_server.store->maps[]中并获取SvcIdentity的handle;
+    end group
+    :如果反复注册失败，则调用exit()函数退出;
+    :如果Endpoint注册成功，将endpoint->running标记为TRUE
+    并调用RegisterRemoteFeatures()远程注册Endpoint特性
+    (即客户端Endpoint的routers向量中的所有元素);
+    :执行StartLoop()函数，进入监听IPC消息的状态
+    如果其它进程向当前handle发送了IPC消息，
+    其会调用Dispatch()函数处理消息，以此对其他进程提供服务;
+    end group
 
 
 ```
+
+### samgr Endpoint
+```plantuml
+!theme plain
+hide empty members
+
+class SamgrServer{
+    GetName()
+    Intialize()
+    GetTaskConifg()
+    MessageHandle()
+    Invoke()
+    identity:Identity
+    samgr: Endpoint
+    mtx: MutexId
+    store: SAStore
+    ipcAuth: IpcAuthInterface
+    sysCapMtx: MutexId
+    sysCapabilitys: Vector
+
+}
+
+class SAStore{
+    saSize:int
+    root: ListNode //存储服务和特性相关信息的链表
+    mapSize: int16
+    mapTop: int16
+    maps: PidHandle[]
+}
+
+class PidHandle{
+    pid: pid_t //客户端EP所在进程的Pid
+    uid: uid_t //客户端EP所在进程拥有者的Uid
+    handle: unit32 //客户端EP的boss线程的Tid
+    deadId: unit32
+}
+
+class ListNode{
+    next: ListNode*
+    info: ServiceInfo
+}
+
+class ServiceInfo{
+    name: char[]
+    handle: unit32
+    head: FeatureNode
+}
+
+class FeatureNode{
+    name: char[]
+    isDefault: unit32
+    token: unit32
+    next FeatureNode
+}
+
+SamgrServer-->SAStore
+SAStore-right->ListNode
+SAStore-->PidHandle
+ListNode-right->ServiceInfo
+ServiceInfo-right->FeatureNode
+
+```
+
+samgr EP接受客户端EP的IPC消息后：
+
+```plantuml
+!theme plain
+:samgr EP的boss线程的StartLoop()循环收到;
+:调用Dispatch()函数处理;
+group Dispatch()
+:GetToken()从ipcMsg中取出token，
+该token指出EP用以处理该消息的Router;
+:获取EP对应的Router，
+endpoint.routers[token];
+:利用router,ipcMsg构建Request,调用HandleIpc();
+end group
+group HandleIpc()
+:解析Request获得ipcMsg,endpoint,router等信息;
+:根据Uid判断是否有权限调用对应Router;
+:调用router->proxy->Invoke()处理IPC消息;
+:根据返回值决定是否响应消息给IPC发送者EP;
+end group
+group samgr的Invoke()
+:调用IpcIoPopUnint32()获取resource,option信息，
+前者决定调用哪个功能函数（RES_ENDPOINT,RES_FEATURE,RES_SYSCAP);
+if (resource) then (RES_ENDPOINT)
+    :调用GenServiceHandle生成SvcIdentity;
+    :配置PidHandle;
+    :存放在g_server.store的maps存储中;
+else (RES_FEATURE)
+    :检查对应PidHandle是否存在;
+    :调用SASTORA_SAVE()将服务或特性节点插入链表中
+    包括ListNode，ServiceInfo，FeatureNode;
+    :客户端EP注册到服务管理者中的服务和特性可以向其它进程提供服务;
+endif
+end group
+
+```
+
+RemoteRegister的clients
+
+```plantuml
+!theme plain
+hide empty members
+
+class RemoteRegister {
+    mtx : MutexId
+    clients : Vector
+    endpoint : Endpoint
+}
+
+class IDefaultClient{
+    key : SaName
+    target: SvcIndentity
+    deadId: unit32
+    context: IpcContext
+    ver: uint16
+    ref: int16
+    IClientProxy: iUnknown
+}
+
+RemoteRegister --> IDefaultClient : clients.data[x]
+
+
+note left of IDefaultClient::IClientProxy
+客户端代理接口类的指针，调用其Invoke()实现服务或特性功能的使用
+end note
+
+```
+
+```plantuml
+!theme plain
+:某进程通过SAMGR_GetInstance()->GetFeatureApi()获取IUnknown接口
+通过调用该接口来调用某个服务或特性;
+:根据serviceName调用GetService()尝试在本进程内查找;
+:本进程无对应ServiceImpl，
+调用SAMGR_FindServiceApi()在SAMGR中查找;
+group SAMGR_FindServiceApi()
+:先查找本进程g_remoteRegister.clients中是否存在接口;
+:若无服务接口，则调用SAMGR_CreateIProxy()通过IPC向服务管理者查询;
+group SAMGR_CreateIProxy()
+:通过QueryIdentity()向samgr EP发送RES_FEATURE类的OP_GET消息;
+:服务管理者在g_server.store->root链表中查找匹配{服务名,特性名}的服务节点或特性节点;
+:返回对应SvcIdentity，其中包含handle和token;
+:调用SAMGR_CreateIClient()创建IDefaultClient对象;
+end group
+:将创建的IDefaultClient放入g_remoteRegister.clients中;
+end group
+:invoke()调用，handle对应的boss线程接收到IPC信息，进入Dispatch()中对IPC消息进行处理;
+```
+
+
 
 >### 打开设备驱动文件
 >设备驱动文件：在类 Unix 系统（如 Linux）中，设备驱动文件通常位于 /dev 目录下。它们是特殊的文件，提供了用户空间程序与硬件设备或虚拟设备交互的接口。通过这些文件，程序可以读取或写入设备，或者执行特定的控制操作。
@@ -1151,7 +1327,3 @@ IpcClientB -down-> SamgrEP : 查询IpcClientA的handle，Router的token\n而后�
 >创建过程：在类 Unix 系统中，这通常通过 mmap 系统调用实现。mmap 调用需要文件描述符、映射区域的大小、期望的保护级别（如是否可读写）、映射类型（共享或私有）等参数。成功调用 mmap 后，它返回一个指向映射区域开始位置的指针。
 >
 >用途：内存映射常用于高效文件访问，以及在多个进程之间共享内存。在 IPC 上下文中，内存映射可以用来创建一个共享的内存区域，让多个进程可以读写同一块内存，从而实现数据共享和通信。
-
-### IpcClient与samgr EP的IPC
-
-### IpcClient之间的IPC
